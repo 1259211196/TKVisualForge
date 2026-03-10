@@ -44,31 +44,113 @@ public class VisualForgeEngine {
     }
     
     // ==========================================
-    // 🎬 核心渲染流水线
+    // 🎬 核心渲染流水线 (全链路贯通版)
     // ==========================================
     public func processVideo(inputURL: URL, outputURL: URL, completion: @escaping (Bool) -> Void) {
-        print("[TKVisualForge] 开始深度洗白: \(inputURL.lastPathComponent)")
+        print("[TKVisualForge] 🚀 开始深度洗白全流程: \(inputURL.lastPathComponent)")
         
-        // 【注：此处为了聚焦核心算法，省略了 AVAssetReader 和 AVAssetWriter 的几百行繁琐配置代码】
-        // 假设我们已经配好了 Reader (读取 YUV 格式) 和 Writer (输出 H.265)...
+        let asset = AVAsset(url: inputURL)
         
-        // 模拟逐帧读取的 While 循环
-        /*
-        while let sampleBuffer = readerTrackOutput.copyNextSampleBuffer() {
-            // ⚠️ 极其关键的安全阀：处理完一帧必须立刻释放内存，否则处理 1080P 视频 5 秒钟必闪退！
-            autoreleasepool {
-                guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-                
-                // 执行 GPU 渲染
-                self.renderFrameOnGPU(pixelBuffer: pixelBuffer)
-                
-                // 将处理完的 pixelBuffer 追加到 AVAssetWriter...
-            }
+        // 1. 获取视频和音频轨道
+        guard let videoTrack = asset.tracks(withMediaType: .video).first else {
+            print("[TKVisualForge] 🔴 错误：找不到视频轨道")
+            completion(false)
+            return
         }
-        */
+        let audioTrack = asset.tracks(withMediaType: .audio).first // 音频可能没有，所以是可选的
         
-        // 模拟完成回调
-        completion(true)
+        do {
+            // 2. 初始化 Reader (拆解机) 和 Writer (压制机)
+            let reader = try AVAssetReader(asset: asset)
+            let writer = try AVAssetWriter(outputURL: outputURL, fileType: .mp4)
+            
+            // --- 视频读取配置 (强制指定 NV12 格式给 Metal 用) ---
+            let readerVideoSettings: [String: Any] = [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+                kCVPixelBufferMetalCompatibilityKey as String: true
+            ]
+            let videoReaderOutput = AVAssetReaderTrackOutput(track: videoTrack, outputSettings: readerVideoSettings)
+            videoReaderOutput.alwaysCopiesSampleData = false // 尽量减少内存复制
+            reader.add(videoReaderOutput)
+            
+            // --- 视频写入配置 (原生 Apple HEVC 硬件编码) ---
+            let writerVideoSettings: [String: Any] = [
+                AVVideoCodecKey: AVVideoCodecType.hevc, // H.265，画质更好，体积更小
+                AVVideoWidthKey: videoTrack.naturalSize.width,
+                AVVideoHeightKey: videoTrack.naturalSize.height
+                // 此处可以注入您的 V12 硬件参数，比如 AVVideoCompressionPropertiesKey
+            ]
+            let videoWriterInput = AVAssetWriterInput(mediaType: .video, outputSettings: writerVideoSettings)
+            videoWriterInput.expectsMediaDataInRealTime = false
+            videoWriterInput.transform = videoTrack.preferredTransform // 保持原视频的方向(竖屏/横屏)
+            writer.add(videoWriterInput)
+            
+            // --- 音频通道配置 (无损搬运) ---
+            var audioReaderOutput: AVAssetReaderTrackOutput?
+            var audioWriterInput: AVAssetWriterInput?
+            if let aTrack = audioTrack {
+                audioReaderOutput = AVAssetReaderTrackOutput(track: aTrack, outputSettings: nil)
+                reader.add(audioReaderOutput!)
+                
+                audioWriterInput = AVAssetWriterInput(mediaType: .audio, outputSettings: nil)
+                audioWriterInput!.expectsMediaDataInRealTime = false
+                writer.add(audioWriterInput!)
+            }
+            
+            // 3. 点火！开始流水线
+            reader.startReading()
+            writer.startWriting()
+            writer.startSession(atSourceTime: .zero)
+            
+            // 4. 开辟后台线程进行逐帧渲染，不卡死 UI
+            let processingQueue = DispatchQueue(label: "com.V12.visualForgeQueue")
+            
+            videoWriterInput.requestMediaDataWhenReady(on: processingQueue) {
+                while videoWriterInput.isReadyForMoreMediaData {
+                    // 读取下一帧
+                    guard let sampleBuffer = videoReaderOutput.copyNextSampleBuffer() else {
+                        // 视频读完了，标记视频通道结束
+                        videoWriterInput.markAsFinished()
+                        
+                        // 视频处理完后，处理音频通道
+                        if let aOutput = audioReaderOutput, let aInput = audioWriterInput {
+                            while let audioBuffer = aOutput.copyNextSampleBuffer() {
+                                if aInput.isReadyForMoreMediaData {
+                                    aInput.append(audioBuffer)
+                                }
+                            }
+                            aInput.markAsFinished()
+                        }
+                        
+                        // 彻底完成收尾工作
+                        writer.finishWriting {
+                            print("[TKVisualForge] 🟢 洗白完成！已生成纯净原生视频。")
+                            DispatchQueue.main.async { completion(true) }
+                        }
+                        break // 跳出循环
+                    }
+                    
+                    // 🌟 极其关键：内存防爆阀与 GPU 渲染调用 🌟
+                    autoreleasepool {
+                        guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+                        
+                        // 提取当前帧的时间戳 (秒)，喂给我们的 Metal 动态时间轴
+                        let time = Float(CMSampleBufferGetPresentationTimeStamp(sampleBuffer).seconds)
+                        
+                        // 【GPU 介入】：原址重构这帧画面！
+                        self.renderFrameOnGPU(pixelBuffer: pixelBuffer, currentTime: time)
+                        
+                        // 因为是原址修改 (Zero-Copy)，我们修改了 pixelBuffer 后，
+                        // 原本的 sampleBuffer 里面的画面就已经变了！直接把它塞给压制机！
+                        videoWriterInput.append(sampleBuffer)
+                    }
+                }
+            }
+            
+        } catch {
+            print("[TKVisualForge] 🔴 管线崩溃: \(error.localizedDescription)")
+            completion(false)
+        }
     }
     
     // ==========================================
