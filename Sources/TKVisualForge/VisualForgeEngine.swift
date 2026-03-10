@@ -72,57 +72,53 @@ public class VisualForgeEngine {
     }
     
     // ==========================================
-    // 🧠 GPU 纹理映射与并发派发
+    // 🧠 GPU 纹理映射与并发派发 (终极动态版)
     // ==========================================
-    private func renderFrameOnGPU(pixelBuffer: CVPixelBuffer) {
+    private func renderFrameOnGPU(pixelBuffer: CVPixelBuffer, currentTime: Float) {
         guard let device = metalDevice,
               let commandQueue = commandQueue,
               let textureCache = textureCache,
               let pipelineState = computePipelineState else { return }
         
-        // 1. 将 CVPixelBuffer 拆解为 Y(亮度) 和 UV(色差) 两张纹理
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
         
         var yTextureRef: CVMetalTexture?
         var uvTextureRef: CVMetalTexture?
         
-        // 获取 Y 通道 (Plane 0) - 格式为 r8Unorm
+        // 映射 Y 通道和 UV 通道
         CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, textureCache, pixelBuffer, nil, .r8Unorm, width, height, 0, &yTextureRef)
-        // 获取 UV 通道 (Plane 1) - 格式为 rg8Unorm，尺寸是 Y 的一半
         CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, textureCache, pixelBuffer, nil, .rg8Unorm, width / 2, height / 2, 1, &uvTextureRef)
         
         guard let yTexture = CVMetalTextureGetTexture(yTextureRef!),
               let uvTexture = CVMetalTextureGetTexture(uvTextureRef!) else { return }
         
-        // 2. 开启 GPU 指令大本营
         guard let commandBuffer = commandQueue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else { return }
         
         encoder.setComputePipelineState(pipelineState)
         
-        // 3. 把纹理“喂”给 CoreShaders.metal 里的参数
-        // 对应着色器里的 [[texture(0)]] 和 [[texture(1)]]
+        // 绑定输入与输出通道
         encoder.setTexture(yTexture, index: 0)
         encoder.setTexture(uvTexture, index: 1)
-        
-        // 因为我们要在原地修改像素（Zero-Copy 回写），所以把输出通道也设为它们自己
-        // 对应着色器里的 [[texture(2)]] 和 [[texture(3)]]
         encoder.setTexture(yTexture, index: 2)
         encoder.setTexture(uvTexture, index: 3)
         
-        // 4. 计算并发线程数 (让 GPU 的所有核心一起上)
+        // 🌟 核心绝杀：将当前帧的播放秒数（时间戳）注射进 GPU 的 Buffer(0)
+        // 这个 timeValue 会直接喂给着色器里的 constant float &time
+        var timeValue = currentTime
+        encoder.setBytes(&timeValue, length: MemoryLayout<Float>.size, index: 0)
+        
+        // 分配并发线程组
         let threadGroupSize = MTLSize(width: 16, height: 16, depth: 1)
         let threadGroups = MTLSize(width: (width + threadGroupSize.width - 1) / threadGroupSize.width,
                                    height: (height + threadGroupSize.height - 1) / threadGroupSize.height,
                                    depth: 1)
         
-        // 5. 派发任务并等待 GPU 执行完毕
+        // 点火！执行并发计算
         encoder.dispatchThreadgroups(threadGroups, threadsPerThreadgroup: threadGroupSize)
         encoder.endEncoding()
         
         commandBuffer.commit()
-        // 阻塞 CPU，直到 GPU 把这一帧的物理重构彻底算完
-        commandBuffer.waitUntilCompleted() 
+        commandBuffer.waitUntilCompleted() // 确保这一帧彻底渲染完毕再放行
     }
-}
